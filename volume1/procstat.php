@@ -6,108 +6,419 @@ class ProcStat {
     private float $hertz;
     private int $limit;
     private string $sort;
+    private bool $watch;
+    private int $interval;
+    private bool $verbose;
 
-    function __construct() {
+    private const MAX_CMD_LENGTH = 80;
+    private const DEFAULT_HERTZ = 100;
+    private const MIN_UPTIME = 0.1;
+    private const DEFAULT_LIMIT = 20;
+    private const DEFAULT_INTERVAL = 2;
+
+    public function __construct() {
         if (PHP_OS_FAMILY !== 'Linux') {
-            fwrite(STDERR, "Only works on Linux.\n");
+            fwrite(STDERR, "Error: This tool only works on Linux systems.\n");
             exit(1);
         }
+        
+        // Initialize verbose first since it's used in other initializations
+        $this->verbose = $this->getArg('--verbose', false) !== false;
+        
+        $this->validateProcFilesystem();
         $this->uptime = $this->getUptime();
         $this->hertz = $this->detectHertz();
-        $this->limit = max(1, (int)$this->getArg('--limit', 20));
-        $this->sort  = $this->getArg('--sort', 'cpu');
+        $this->limit = max(1, (int)$this->getArg('--limit', self::DEFAULT_LIMIT));
+        $this->sort = $this->getArg('--sort', 'cpu');
+        $this->watch = $this->getArg('--watch', 0) > 0;
+        $this->interval = max(1, (int)$this->getArg('--watch', self::DEFAULT_INTERVAL));
+        
+        $this->validateOptions();
     }
 
-    private function getArg(string $name, $default) {
-        $args = getopt('', [$name . ':']);
+    private function getArg(string $name, mixed $default): mixed {
+        $longOpts = [];
+        if ($default === false) {
+            // Boolean flag
+            $longOpts = [$name];
+        } else {
+            // Value option
+            $longOpts = [$name . ':'];
+        }
+        
+        $args = getopt('', $longOpts);
+        
+        if ($default === false) {
+            return isset($args[$name]);
+        }
+        
         return $args[$name] ?? $default;
     }
 
+    private function validateOptions(): void {
+        $validSorts = ['cpu', 'mem', 'pid', 'command'];
+        if (!in_array($this->sort, $validSorts)) {
+            fwrite(STDERR, "Warning: Invalid sort option '{$this->sort}'. Using 'cpu'.\n");
+            $this->sort = 'cpu';
+        }
+        
+        if ($this->limit > 1000) {
+            fwrite(STDERR, "Warning: Limit too high. Capping at 1000.\n");
+            $this->limit = 1000;
+        }
+    }
+
+    private function validateProcFilesystem(): void {
+        if (!file_exists('/proc') || !is_dir('/proc')) {
+            throw new RuntimeException('/proc filesystem not available');
+        }
+        
+        // Basic sanity checks
+        if (!file_exists('/proc/self') && !file_exists('/proc/version')) {
+            throw new RuntimeException('/proc does not appear to be a valid proc filesystem');
+        }
+    }
+
+    private function validateProcPath(string $path): bool {
+        $realpath = realpath($path);
+        if (!$realpath) {
+            return false;
+        }
+        
+        // Must be under /proc and follow safe patterns
+        if (strpos($realpath, '/proc/') !== 0) {
+            return false;
+        }
+        
+        // Allow specific patterns
+        $allowedPatterns = [
+            '#^/proc/\d+$#',
+            '#^/proc/\d+/stat$#',
+            '#^/proc/\d+/status$#',
+            '#^/proc/\d+/cmdline$#',
+        ];
+        
+        foreach ($allowedPatterns as $pattern) {
+            if (preg_match($pattern, $realpath)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
     private function getUptime(): float {
-        $c = file_get_contents('/proc/uptime');
-        return $c ? (float)explode(' ', trim($c))[0] : 0.1;
+        $content = @file_get_contents('/proc/uptime');
+        if ($content === false) {
+            throw new RuntimeException('Cannot read /proc/uptime - check permissions');
+        }
+        
+        $parts = explode(' ', trim($content));
+        if (count($parts) < 2) {
+            throw new RuntimeException('Invalid format in /proc/uptime');
+        }
+        
+        $uptime = (float)$parts[0];
+        if ($uptime <= 0) {
+            throw new RuntimeException('Invalid uptime value');
+        }
+        
+        if ($this->verbose) {
+            fwrite(STDERR, "Debug: System uptime: {$uptime}s\n");
+        }
+        
+        return $uptime;
     }
 
     private function detectHertz(): float {
-        $hz = (int)shell_exec('getconf CLK_TCK 2>/dev/null');
-        return $hz > 0 ? $hz : 100;
-    }
-
-    function run(): void {
-        $stats = [];
-        foreach (new DirectoryIterator('/proc') as $entry) {
-            if ($entry->isDir() && ctype_digit($entry->getFilename())) {
-                $p = $this->readProcess((int)$entry->getFilename());
-                if ($p) $stats[] = $p;
+        $output = @shell_exec('getconf CLK_TCK 2>/dev/null');
+        $hz = $output ? (int)trim($output) : 0;
+        
+        if ($hz <= 0) {
+            if ($this->verbose) {
+                fwrite(STDERR, "Debug: Using default HERTZ value: " . self::DEFAULT_HERTZ . "\n");
+            }
+            $hz = self::DEFAULT_HERTZ;
+        } else {
+            if ($this->verbose) {
+                fwrite(STDERR, "Debug: Detected HERTZ: {$hz}\n");
             }
         }
-        $this->render($stats);
+        
+        return $hz;
     }
 
-    private function readProcess(int $pid): ?array {
-        if (!is_readable("/proc/$pid/stat")) {
-            return null;
+    public function run(): void {
+        if ($this->getArg('--help', false) !== false) {
+            $this->showHelp();
+            return;
         }
         
-        $s = file_get_contents("/proc/$pid/stat");
-        if (!$s) return null;
+        if ($this->watch) {
+            $this->runWatchMode();
+        } else {
+            $this->runOnce();
+        }
+    }
+
+    private function showHelp(): void {
+        echo "Process Monitor - Linux Process Statistics\n";
+        echo "Usage: " . basename($_SERVER['argv'][0]) . " [OPTIONS]\n\n";
+        echo "Options:\n";
+        echo "  --limit=N    Show top N processes (default: " . self::DEFAULT_LIMIT . ")\n";
+        echo "  --sort=TYPE  Sort by: cpu, mem, pid, command (default: cpu)\n";
+        echo "  --watch=N    Refresh every N seconds, continuous mode\n";
+        echo "  --verbose    Show debug information\n";
+        echo "  --help       Show this help message\n\n";
+        echo "Examples:\n";
+        echo "  Show top 10 CPU processes:    " . basename($_SERVER['argv'][0]) . " --limit=10\n";
+        echo "  Show top memory processes:    " . basename($_SERVER['argv'][0]) . " --sort=mem\n";
+        echo "  Monitor continuously:         " . basename($_SERVER['argv'][0]) . " --watch=2\n";
+    }
+
+    private function runWatchMode(): void {
+        $iteration = 0;
+        $startTime = time();
         
-        $a = explode(' ', $s);
-        if (count($a) < 22) return null;
+        // Setup signal handling for graceful exit
+        if (function_exists('pcntl_signal')) {
+            pcntl_signal(SIGINT, function() use ($startTime) {
+                $duration = time() - $startTime;
+                echo "\nMonitoring stopped after {$duration} seconds.\n";
+                exit(0);
+            });
+        }
+        
+        echo "Process Monitor - Refresh every {$this->interval}s (Ctrl+C to stop)\n";
+        
+        while (true) {
+            if ($iteration++ > 0) {
+                // Clear screen and move cursor to top
+                echo "\033[2J\033[;H";
+            }
+            
+            $this->displayHeader($iteration);
+            $this->runOnce();
+            
+            // Sleep with signal checking
+            $slept = 0;
+            while ($slept < $this->interval) {
+                if (function_exists('pcntl_signal_dispatch')) {
+                    pcntl_signal_dispatch();
+                }
+                sleep(1);
+                $slept++;
+            }
+        }
+    }
+    
+    private function displayHeader(int $iteration): void {
+        echo "Process Monitor - Iteration #{$iteration} - " . date('Y-m-d H:i:s') . "\n";
+        echo "Sorting by: " . strtoupper($this->sort) . " | Showing top: {$this->limit} | Refresh: {$this->interval}s\n";
+        echo str_repeat('=', 80) . "\n\n";
+    }
 
-        [$utime, $stime, $cutime, $cstime, $starttime] = [
-            (float)$a[13], (float)$a[14], (float)$a[15], (float)$a[16], (float)$a[21]
-        ];
-        $total = $utime + $stime + $cutime + $cstime;
-        $seconds = $this->uptime - ($starttime / $this->hertz);
-        $cpu = $seconds > 0 ? round(100 * (($total / $this->hertz) / $seconds), 1) : 0;
-
-        $rss = 0;
-        $statusFile = "/proc/$pid/status";
-        if (is_readable($statusFile)) {
-            foreach (file($statusFile) as $line) {
-                if (str_starts_with($line, 'VmRSS:')) {
-                    $rss = (int)filter_var($line, FILTER_SANITIZE_NUMBER_INT);
-                    break;
+    private function runOnce(): void {
+        $startTime = microtime(true);
+        $stats = [];
+        $processCount = 0;
+        $errorCount = 0;
+        
+        foreach (new DirectoryIterator('/proc') as $entry) {
+            if ($entry->isDot()) continue;
+            
+            if ($entry->isDir() && ctype_digit($entry->getFilename())) {
+                $pid = (int)$entry->getFilename();
+                $processCount++;
+                
+                if ($process = $this->readProcess($pid)) {
+                    $stats[] = $process;
+                } else {
+                    $errorCount++;
                 }
             }
         }
+        
+        $executionTime = round((microtime(true) - $startTime) * 1000, 2);
+        
+        if ($this->verbose && !$this->watch) {
+            fwrite(STDERR, "Debug: Scanned {$processCount} processes, {$errorCount} errors, took {$executionTime}ms\n");
+        }
+        
+        $this->render($stats);
+        
+        if (!$this->watch) {
+            echo "\nTotal processes: " . count($stats) . " (scanned {$processCount})\n";
+        }
+    }
 
-        $cmd = '';
-        $cmdlineFile = "/proc/$pid/cmdline";
-        if (is_readable($cmdlineFile)) {
-            $cmdline = file_get_contents($cmdlineFile);
-            $cmd = trim(str_replace("\0", ' ', $cmdline));
+    private function readProcess(int $pid): ?array {
+        $statPath = "/proc/{$pid}/stat";
+        if (!$this->validateProcPath($statPath) || !is_readable($statPath)) {
+            return null;
         }
         
-        if ($cmd === '') {
-            $cmd = '[' . trim($a[1], '()') . ']';
+        $statContent = @file_get_contents($statPath);
+        if (!$statContent) {
+            return null;
         }
         
-        $cmd = mb_strimwidth($cmd, 0, 80, '…', 'UTF-8');
+        // Parse the stat file - handle process names with spaces and parentheses
+        $lastParen = strrpos($statContent, ')');
+        if ($lastParen === false) {
+            return null;
+        }
+        
+        $namePart = substr($statContent, 0, $lastParen + 1);
+        $dataPart = substr($statContent, $lastParen + 2); // Skip ') '
+        
+        // Extract process name (remove parentheses)
+        $processName = trim($namePart, '()');
+        
+        // Parse the remaining fields
+        $fields = explode(' ', $dataPart);
+        if (count($fields) < 21) {
+            return null;
+        }
+        
+        // Field indices are shifted because we removed the command name part
+        // Original indices from proc man page: utime=14, stime=15, cutime=16, cstime=17, starttime=22
+        // Our indices are: utime=13, stime=14, cutime=15, cstime=16, starttime=21
+        [$utime, $stime, $cutime, $cstime, $starttime] = [
+            (float)($fields[13] ?? 0),
+            (float)($fields[14] ?? 0),  
+            (float)($fields[15] ?? 0),
+            (float)($fields[16] ?? 0),
+            (float)($fields[21] ?? 0)
+        ];
+        
+        // Calculate CPU usage percentage
+        $totalTime = $utime + $stime + $cutime + $cstime;
+        $secondsElapsed = $this->uptime - ($starttime / $this->hertz);
+        
+        if ($secondsElapsed <= 0) {
+            $cpuUsage = 0.0;
+        } else {
+            $cpuUsage = round(100 * (($totalTime / $this->hertz) / $secondsElapsed), 1);
+            // Cap at 100% to handle edge cases
+            $cpuUsage = min($cpuUsage, 100.0);
+        }
+
+        $memoryUsage = $this->getMemoryUsage($pid);
+        $command = $this->getProcessCommand($pid, $processName);
 
         return [
             'PID' => $pid,
-            'CPU%' => $cpu,
-            'MEM(MB)' => round($rss / 1024, 1),
-            'CMD' => $cmd
+            'CPU%' => $cpuUsage,
+            'MEM(MB)' => $memoryUsage,
+            'CMD' => $command,
+            'TIME' => $totalTime / $this->hertz // Total CPU time in seconds
         ];
     }
 
+    private function getMemoryUsage(int $pid): float {
+        $statusPath = "/proc/{$pid}/status";
+        if (!$this->validateProcPath($statusPath) || !is_readable($statusPath)) {
+            return 0.0;
+        }
+        
+        $content = @file_get_contents($statusPath);
+        if (!$content) {
+            return 0.0;
+        }
+        
+        foreach (explode("\n", $content) as $line) {
+            if (str_starts_with($line, 'VmRSS:')) {
+                $kb = (int)filter_var($line, FILTER_SANITIZE_NUMBER_INT);
+                return round($kb / 1024, 1);
+            }
+        }
+        
+        return 0.0;
+    }
+
+    private function getProcessCommand(int $pid, string $defaultName): string {
+        $cmdlinePath = "/proc/{$pid}/cmdline";
+        if (!$this->validateProcPath($cmdlinePath) || !is_readable($cmdlinePath)) {
+            return '[' . $this->sanitizeOutput($defaultName) . ']';
+        }
+        
+        $cmdline = @file_get_contents($cmdlinePath);
+        if (!$cmdline) {
+            return '[' . $this->sanitizeOutput($defaultName) . ']';
+        }
+        
+        $command = trim(str_replace("\0", ' ', $cmdline));
+        if ($command === '') {
+            return '[' . $this->sanitizeOutput($defaultName) . ']';
+        }
+        
+        // Sanitize command for safe display
+        $command = $this->sanitizeOutput($command);
+        
+        return mb_strimwidth($command, 0, self::MAX_CMD_LENGTH, '…', 'UTF-8');
+    }
+    
+    private function sanitizeOutput(string $text): string {
+        // Convert to UTF-8 and remove control characters except tab and newline
+        $text = mb_convert_encoding($text, 'UTF-8', 'UTF-8');
+        $text = preg_replace('/[^\x20-\x7E\t\n]/u', '?', $text);
+        return $text;
+    }
+
     private function render(array $data): void {
-        $key = match ($this->sort) {
+        if (empty($data)) {
+            echo "No process data available. Check permissions or system status.\n";
+            return;
+        }
+        
+        $sortKey = match ($this->sort) {
             'mem' => 'MEM(MB)',
             'pid' => 'PID',
+            'command' => 'CMD',
             default => 'CPU%',
         };
         
-        usort($data, fn($x, $y) => $y[$key] <=> $x[$key]);
+        // Sort processes
+        usort($data, function($a, $b) use ($sortKey) {
+            $result = $b[$sortKey] <=> $a[$sortKey];
+            // Secondary sort by PID for stability
+            return $result !== 0 ? $result : $a['PID'] <=> $b['PID'];
+        });
         
-        printf("%5s %6s %9s %s\n", 'PID', 'CPU%', 'MEM(MB)', 'CMD');
-        foreach (array_slice($data, 0, $this->limit) as $p) {
-            printf("%5d %6.1f %9.1f %s\n", $p['PID'], $p['CPU%'], $p['MEM(MB)'], $p['CMD']);
+        // Display header
+        printf("%-6s %-6s %-10s %s\n", 'PID', 'CPU%', 'MEM(MB)', 'COMMAND');
+        echo str_repeat('-', 80) . "\n";
+        
+        // Display processes
+        $displayData = array_slice($data, 0, $this->limit);
+        foreach ($displayData as $process) {
+            printf("%-6d %-6.1f %-10.1f %s\n", 
+                $process['PID'], 
+                $process['CPU%'], 
+                $process['MEM(MB)'], 
+                $process['CMD']
+            );
+        }
+        
+        // Show summary stats
+        $totalMemory = array_sum(array_column($displayData, 'MEM(MB)'));
+        $totalCpu = array_sum(array_column($displayData, 'CPU%'));
+        
+        if (!$this->watch) {
+            echo str_repeat('-', 80) . "\n";
+            printf("Top %d processes: %.1f%% CPU, %.1f MB MEM\n", 
+                count($displayData), $totalCpu, $totalMemory);
         }
     }
 }
 
-(new ProcStat)->run();
+// Main execution with error handling
+try {
+    $procStat = new ProcStat();
+    $procStat->run();
+} catch (Exception $e) {
+    fwrite(STDERR, "Error: " . $e->getMessage() . "\n");
+    fwrite(STDERR, "Try running with --help for usage information.\n");
+    exit(1);
+}
