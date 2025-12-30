@@ -13,17 +13,23 @@ class ProcStat {
     private bool $zombie;
     private bool $threads;
     private int $threadLimit;
+    private int $maxPidScan;
+    private bool $useMb;
+    private float $lastScanTime;
 
-    private const MAX_CMD_LENGTH = 80;
-    private const DEFAULT_HERTZ = 100;
+    private const DEFAULT_HERTZ = 100.0;
     private const MIN_UPTIME = 0.1;
     private const DEFAULT_LIMIT = 20;
     private const DEFAULT_INTERVAL = 2;
-    private const MAX_PID_SCAN = 32768;
-    private const MAX_THREADS_PER_PROC = 1000;
+    private const DEFAULT_MAX_PID_SCAN = 131072;
+    private const DEFAULT_THREAD_LIMIT = 1000;
+    private const DEFAULT_CMD_LENGTH = 80;
     private const VALID_SORTS = ['cpu', 'mem', 'pid', 'command', 'time'];
+    private const FLOAT_EPSILON = 0.00001;
 
     private bool $shutdownRequested = false;
+    private array $previousStats = [];
+    private ?float $previousUptime = null;
 
     public function __construct() {
         if (PHP_OS_FAMILY !== 'Linux') {
@@ -35,6 +41,7 @@ class ProcStat {
         $this->validateProcFilesystem();
         $this->hertz = $this->detectHertz();
         $this->validateOptions();
+        $this->setupResourceLimits();
     }
 
     private function parseArguments(): void {
@@ -48,6 +55,9 @@ class ProcStat {
             "zombie",
             "threads",
             "thread-limit:",
+            "max-scan:",
+            "kb",
+            "mb",
         ];
 
         $options = getopt($shortOpts, $longOpts);
@@ -62,7 +72,9 @@ class ProcStat {
         $this->verbose = isset($options['verbose']);
         $this->zombie = isset($options['zombie']);
         $this->threads = isset($options['threads']);
-        $this->threadLimit = (int)($options['thread-limit'] ?? self::MAX_THREADS_PER_PROC);
+        $this->threadLimit = (int)($options['thread-limit'] ?? self::DEFAULT_THREAD_LIMIT);
+        $this->maxPidScan = (int)($options['max-scan'] ?? self::DEFAULT_MAX_PID_SCAN);
+        $this->useMb = !isset($options['kb']);
         
         if (isset($options['watch'])) {
             $this->watch = true;
@@ -75,7 +87,7 @@ class ProcStat {
     }
 
     private function validateOptions(): void {
-        if (!in_array($this->sort, self::VALID_SORTS)) {
+        if (!in_array($this->sort, self::VALID_SORTS, true)) {
             fwrite(STDERR, "Warning: Invalid sort option '{$this->sort}'. Using 'cpu'.\n");
             $this->sort = 'cpu';
         }
@@ -92,56 +104,113 @@ class ProcStat {
         
         if ($this->threadLimit < 1 || $this->threadLimit > 10000) {
             fwrite(STDERR, "Warning: Thread limit must be between 1 and 10000. Using default.\n");
-            $this->threadLimit = self::MAX_THREADS_PER_PROC;
+            $this->threadLimit = self::DEFAULT_THREAD_LIMIT;
+        }
+        
+        if ($this->maxPidScan < 100 || $this->maxPidScan > 1000000) {
+            fwrite(STDERR, "Warning: Max scan must be between 100 and 1000000. Using default.\n");
+            $this->maxPidScan = self::DEFAULT_MAX_PID_SCAN;
+        }
+    }
+
+    private function setupResourceLimits(): void {
+        if (function_exists('setrlimit')) {
+            $maxFiles = min(4096, $this->maxPidScan * 3);
+            @setrlimit(RLIMIT_NOFILE, $maxFiles, $maxFiles);
+            
+            $maxTime = 30;
+            @setrlimit(RLIMIT_CPU, $maxTime, $maxTime);
         }
     }
 
     private function validateProcFilesystem(): void {
         if (!file_exists('/proc') || !is_dir('/proc')) {
-            throw new RuntimeException('/proc filesystem not available');
+            throw new RuntimeException('/proc filesystem not available or not mounted');
         }
         
         if (!file_exists('/proc/self') && !file_exists('/proc/version')) {
             throw new RuntimeException('/proc does not appear to be a valid proc filesystem');
         }
+        
+        if (!is_readable('/proc/uptime')) {
+            throw new RuntimeException('/proc/uptime is not readable. Check permissions or run with sudo');
+        }
     }
 
     private function validateProcPath(string $path): bool {
-        if (!str_starts_with($path, '/proc/')) {
+        $resolved = realpath($path);
+        if ($resolved === false) {
             return false;
         }
         
-        $canonicalPath = realpath($path);
-        if (!$canonicalPath) {
+        if (!str_starts_with($resolved, '/proc/')) {
             return false;
         }
         
-        if (!str_starts_with($canonicalPath, '/proc/')) {
+        $components = explode('/', trim($resolved, '/'));
+        
+        if (count($components) < 2) {
             return false;
         }
         
-        $allowedPatterns = [
-            '#^/proc/\d+$#',
-            '#^/proc/\d+/stat$#',
-            '#^/proc/\d+/status$#',
-            '#^/proc/\d+/cmdline$#',
-            '#^/proc/\d+/task/\d+$#',
-            '#^/proc/\d+/task/\d+/stat$#',
-        ];
+        if ($components[0] !== 'proc') {
+            return false;
+        }
         
-        foreach ($allowedPatterns as $pattern) {
-            if (preg_match($pattern, $canonicalPath)) {
-                return true;
-            }
+        if (!ctype_digit($components[1])) {
+            return false;
+        }
+        
+        $pid = (int)$components[1];
+        if ($pid <= 0 || $pid > PHP_INT_MAX) {
+            return false;
+        }
+        
+        if (count($components) === 2) {
+            return is_dir($resolved);
+        }
+        
+        $allowedFiles = ['stat', 'status', 'cmdline', 'task'];
+        if (count($components) === 3) {
+            return in_array($components[2], $allowedFiles, true);
+        }
+        
+        if ($components[2] === 'task' && count($components) === 4) {
+            return ctype_digit($components[3]) && is_dir($resolved);
+        }
+        
+        if ($components[2] === 'task' && count($components) === 5) {
+            return ctype_digit($components[3]) && $components[4] === 'stat';
         }
         
         return false;
     }
 
+    private function safeFileRead(string $path): ?string {
+        if (!$this->validateProcPath($path)) {
+            return null;
+        }
+        
+        $handle = @fopen($path, 'rb');
+        if ($handle === false) {
+            return null;
+        }
+        
+        flock($handle, LOCK_SH);
+        
+        try {
+            $content = @stream_get_contents($handle);
+            return $content !== false ? $content : null;
+        } finally {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
+    }
+
     private function getUptime(): float {
         $content = @file_get_contents('/proc/uptime');
         if ($content === false) {
-            throw new RuntimeException('Cannot read /proc/uptime');
+            throw new RuntimeException('Cannot read /proc/uptime. Check permissions or run with appropriate privileges');
         }
         
         $parts = explode(' ', trim($content));
@@ -150,20 +219,37 @@ class ProcStat {
         }
         
         $uptime = (float)$parts[0];
-        if ($uptime <= 0) {
-            throw new RuntimeException('Invalid uptime value');
+        if ($uptime <= self::FLOAT_EPSILON) {
+            throw new RuntimeException('Invalid uptime value in /proc/uptime');
         }
         
         return $uptime;
     }
 
     private function detectHertz(): float {
-        $output = @shell_exec('getconf CLK_TCK 2>/dev/null');
-        if ($output !== null) {
-            $hz = (int)trim($output);
+        $content = @file_get_contents('/proc/self/stat');
+        if ($content !== false) {
+            $fields = explode(' ', $content);
+            if (isset($fields[41])) {
+                $clockTicks = (int)$fields[41];
+                if ($clockTicks > 0) {
+                    if ($this->verbose) {
+                        fwrite(STDERR, "Debug: Detected HERTZ from /proc/self/stat: {$clockTicks}\n");
+                    }
+                    return (float)$clockTicks;
+                }
+            }
+        }
+        
+        $output = [];
+        $result = -1;
+        @exec('getconf CLK_TCK', $output, $result);
+        
+        if ($result === 0 && isset($output[0])) {
+            $hz = (int)$output[0];
             if ($hz > 0) {
                 if ($this->verbose) {
-                    fwrite(STDERR, "Debug: Detected HERTZ: {$hz}\n");
+                    fwrite(STDERR, "Debug: Detected HERTZ from getconf: {$hz}\n");
                 }
                 return (float)$hz;
             }
@@ -198,11 +284,17 @@ Options:
       --zombie          Include zombie processes
       --threads         Show thread information
       --thread-limit=N  Maximum threads per process (default: 1000)
+      --max-scan=N      Maximum PIDs to scan (default: 131072)
+      --kb              Show memory in kilobytes
+      --mb              Show memory in megabytes (default)
 
 Examples:
   {$scriptName} --limit=10 --sort=mem
   {$scriptName} --watch=5 --threads
-  {$scriptName} --verbose --zombie
+  {$scriptName} --verbose --zombie --kb
+  sudo {$scriptName} --limit=20 --sort=cpu
+
+Note: Some systems may require sudo/root privileges to read all process information.
 
 HELP;
     }
@@ -218,13 +310,17 @@ HELP;
                 echo "\033[2J\033[;H";
             }
             
-            $uptime = $this->getUptime();
-            $this->displayHeader($iteration, $uptime);
-            $this->runOnceWithUptime($uptime);
-            
-            for ($i = 0; $i < $this->interval && !$this->shutdownRequested; $i++) {
-                sleep(1);
+            try {
+                $uptime = $this->getUptime();
+                $this->displayHeader($iteration, $uptime);
+                $this->runOnceWithUptime($uptime);
+            } catch (RuntimeException $e) {
+                echo "Error: " . $e->getMessage() . "\n";
+                $this->shutdownRequested = true;
+                break;
             }
+            
+            $this->sleepWithInterrupt($this->interval);
         }
         
         echo "\nShutting down...\n";
@@ -238,24 +334,43 @@ HELP;
         if (function_exists('pcntl_signal')) {
             pcntl_signal(SIGINT, [$this, 'handleSignal']);
             pcntl_signal(SIGTERM, [$this, 'handleSignal']);
+            if (defined('SIGHUP')) {
+                pcntl_signal(SIGHUP, [$this, 'handleSignal']);
+            }
         }
     }
 
     private function handleSignal(int $signal): void {
-        $this->shutdownRequested = true;
+        static $handled = false;
+        if (!$handled) {
+            $handled = true;
+            $this->shutdownRequested = true;
+        }
+    }
+
+    private function sleepWithInterrupt(int $seconds): void {
+        $remaining = $seconds;
+        while ($remaining > 0 && !$this->shutdownRequested) {
+            $sleepTime = min($remaining, 1);
+            sleep($sleepTime);
+            $remaining -= $sleepTime;
+        }
     }
 
     private function displayHeader(int $iteration, float $uptime): void {
+        $memoryUnit = $this->useMb ? 'MB' : 'KB';
+        
         echo sprintf("Process Monitor - Iteration #%d - %s - Uptime: %.0fs\n",
             $iteration,
             date('Y-m-d H:i:s'),
             $uptime
         );
         
-        echo sprintf("Sorting by: %s | Showing top: %d | Refresh: %ds",
+        echo sprintf("Sorting by: %s | Showing top: %d | Refresh: %ds | Memory: %s",
             strtoupper($this->sort),
             $this->limit,
-            $this->interval
+            $this->interval,
+            $memoryUnit
         );
         
         $modes = [];
@@ -270,8 +385,15 @@ HELP;
     }
 
     private function runOnce(): void {
-        $uptime = $this->getUptime();
-        $this->runOnceWithUptime($uptime);
+        try {
+            $uptime = $this->getUptime();
+            $this->previousUptime = $uptime;
+            $this->lastScanTime = microtime(true);
+            $this->runOnceWithUptime($uptime);
+        } catch (RuntimeException $e) {
+            echo "Error: " . $e->getMessage() . "\n";
+            exit(1);
+        }
     }
 
     private function runOnceWithUptime(float $uptime): void {
@@ -280,39 +402,38 @@ HELP;
         $procCount = 0;
         $errorCount = 0;
         
-        $dir = @opendir('/proc');
-        if (!$dir) {
-            echo "Error: Cannot access /proc directory\n";
+        $pids = $this->scanProcDirectory();
+        if ($pids === null) {
+            echo "Error: Cannot access /proc directory. Check permissions.\n";
             return;
         }
         
-        while (($entry = readdir($dir)) !== false) {
-            if ($entry === '.' || $entry === '..' || !ctype_digit($entry)) {
-                continue;
-            }
-            
-            $pid = (int)$entry;
+        $currentScanTime = microtime(true);
+        $interval = $this->previousUptime !== null ? $currentScanTime - $this->lastScanTime : 1.0;
+        $this->lastScanTime = $currentScanTime;
+        
+        foreach ($pids as $pid) {
             $procCount++;
             
-            if ($procCount > self::MAX_PID_SCAN) {
-                fwrite(STDERR, "Warning: Too many processes, stopping scan\n");
+            if ($procCount > $this->maxPidScan) {
+                if ($this->verbose) {
+                    fwrite(STDERR, "Warning: Too many processes, stopping scan at {$procCount}\n");
+                }
                 break;
             }
             
-            $process = $this->readProcess($pid, $uptime);
+            $process = $this->readProcess($pid, $uptime, $interval);
             if ($process !== null) {
                 $processes[] = $process;
                 
                 if ($this->threads) {
-                    $threads = $this->readThreads($pid, $uptime);
+                    $threads = $this->readThreads($pid, $uptime, $interval);
                     $processes = array_merge($processes, $threads);
                 }
             } else {
                 $errorCount++;
             }
         }
-        
-        closedir($dir);
         
         $executionTime = round((microtime(true) - $startTime) * 1000, 2);
         
@@ -324,15 +445,32 @@ HELP;
         
         if (!$this->watch) {
             echo "\nTotal processes displayed: " . count($processes) . "\n";
+            if ($errorCount > 0) {
+                echo "Note: {$errorCount} processes could not be read (permissions or terminated)\n";
+            }
         }
+        
+        $this->previousUptime = $uptime;
     }
 
-    private function readProcess(int $pid, float $uptime): ?array {
-        $statPath = "/proc/{$pid}/stat";
-        if (!$this->validateProcPath($statPath)) {
+    private function scanProcDirectory(): ?array {
+        $entries = @scandir('/proc', SCANDIR_SORT_NONE);
+        if ($entries === false) {
             return null;
         }
         
+        $pids = [];
+        foreach ($entries as $entry) {
+            if ($entry !== '.' && $entry !== '..' && ctype_digit($entry)) {
+                $pids[] = (int)$entry;
+            }
+        }
+        
+        return $pids;
+    }
+
+    private function readProcess(int $pid, float $uptime, float $interval): ?array {
+        $statPath = "/proc/{$pid}/stat";
         $content = @file_get_contents($statPath);
         if ($content === false) {
             return null;
@@ -340,7 +478,7 @@ HELP;
         
         $content = trim($content);
         
-        if (!$this->zombie && str_contains($content, ') Z ')) {
+        if (!$this->zombie && strpos($content, ') Z ') !== false) {
             return null;
         }
         
@@ -364,16 +502,18 @@ HELP;
         $stime = (float)($fields[12] ?? 0);
         $cutime = (float)($fields[13] ?? 0);
         $cstime = (float)($fields[14] ?? 0);
-        $starttime = (float)($fields[19] ?? 0);
         
         $totalTime = $utime + $stime + $cutime + $cstime;
-        $secondsElapsed = $uptime - ($starttime / $this->hertz);
         
-        $cpuUsage = 0.0;
-        if ($secondsElapsed > self::MIN_UPTIME) {
-            $cpuUsage = 100 * (($totalTime / $this->hertz) / $secondsElapsed);
-            $cpuUsage = min($cpuUsage, 100.0);
-        }
+        $previousKey = "{$pid}_process";
+        $previousTotalTime = $this->previousStats[$previousKey]['total_time'] ?? 0.0;
+        
+        $cpuUsage = $this->calculateCpuUsage($totalTime, $previousTotalTime, $interval);
+        
+        $this->previousStats[$previousKey] = [
+            'total_time' => $totalTime,
+            'timestamp' => microtime(true)
+        ];
         
         $memory = $this->getMemoryUsage($pid);
         $command = $this->getProcessCommand($pid, $name);
@@ -390,21 +530,25 @@ HELP;
         ];
     }
 
-    private function readThreads(int $pid, float $uptime): array {
+    private function readThreads(int $pid, float $uptime, float $interval): array {
         $threads = [];
         $taskDir = "/proc/{$pid}/task";
         
-        if (!$this->validateProcPath($taskDir) || !is_dir($taskDir)) {
+        if (!is_dir($taskDir)) {
             return $threads;
         }
         
-        $dir = @opendir($taskDir);
-        if (!$dir) {
+        $entries = @scandir($taskDir, SCANDIR_SORT_NONE);
+        if ($entries === false) {
             return $threads;
         }
         
         $count = 0;
-        while (($entry = readdir($dir)) !== false && $count < $this->threadLimit) {
+        foreach ($entries as $entry) {
+            if ($count >= $this->threadLimit) {
+                break;
+            }
+            
             if ($entry === '.' || $entry === '..' || !ctype_digit($entry)) {
                 continue;
             }
@@ -414,23 +558,18 @@ HELP;
                 continue;
             }
             
-            $thread = $this->readThread($pid, $tid, $uptime);
+            $thread = $this->readThread($pid, $tid, $uptime, $interval);
             if ($thread !== null) {
                 $threads[] = $thread;
                 $count++;
             }
         }
         
-        closedir($dir);
         return $threads;
     }
 
-    private function readThread(int $pid, int $tid, float $uptime): ?array {
+    private function readThread(int $pid, int $tid, float $uptime, float $interval): ?array {
         $statPath = "/proc/{$pid}/task/{$tid}/stat";
-        if (!$this->validateProcPath($statPath)) {
-            return null;
-        }
-        
         $content = @file_get_contents($statPath);
         if ($content === false) {
             return null;
@@ -457,11 +596,15 @@ HELP;
         
         $totalTime = $utime + $stime;
         
-        $cpuUsage = 0.0;
-        if ($uptime > self::MIN_UPTIME) {
-            $cpuUsage = 100 * (($totalTime / $this->hertz) / $uptime);
-            $cpuUsage = min($cpuUsage, 100.0);
-        }
+        $previousKey = "{$pid}_{$tid}_thread";
+        $previousTotalTime = $this->previousStats[$previousKey]['total_time'] ?? 0.0;
+        
+        $cpuUsage = $this->calculateCpuUsage($totalTime, $previousTotalTime, $interval);
+        
+        $this->previousStats[$previousKey] = [
+            'total_time' => $totalTime,
+            'timestamp' => microtime(true)
+        ];
         
         $memory = $this->getMemoryUsage($tid);
         
@@ -477,12 +620,31 @@ HELP;
         ];
     }
 
-    private function getMemoryUsage(int $pid): float {
-        $statusPath = "/proc/{$pid}/status";
-        if (!$this->validateProcPath($statusPath)) {
+    private function calculateCpuUsage(float $totalTime, float $previousTotalTime, float $interval): float {
+        if ($interval <= self::FLOAT_EPSILON) {
             return 0.0;
         }
         
+        $timeDiff = $totalTime - $previousTotalTime;
+        if ($timeDiff < 0) {
+            $timeDiff = 0.0;
+        }
+        
+        $cpuUsage = 100.0 * ($timeDiff / $this->hertz) / $interval;
+        
+        if ($cpuUsage < 0.0) {
+            return 0.0;
+        }
+        
+        if ($cpuUsage > 100.0) {
+            return 100.0;
+        }
+        
+        return $cpuUsage;
+    }
+
+    private function getMemoryUsage(int $pid): float {
+        $statusPath = "/proc/{$pid}/status";
         $content = @file_get_contents($statusPath);
         if ($content === false) {
             return 0.0;
@@ -500,15 +662,19 @@ HELP;
             }
         }
         
-        return $rss > 0 ? $rss / 1024 : 0.0;
+        if ($rss <= 0) {
+            return 0.0;
+        }
+        
+        if ($this->useMb) {
+            return $rss / 1024.0;
+        }
+        
+        return (float)$rss;
     }
 
     private function getProcessCommand(int $pid, string $defaultName): string {
         $cmdlinePath = "/proc/{$pid}/cmdline";
-        if (!$this->validateProcPath($cmdlinePath)) {
-            return '[' . $this->sanitizeOutput($defaultName) . ']';
-        }
-        
         $content = @file_get_contents($cmdlinePath);
         if ($content === false || strlen($content) === 0) {
             return '[' . $this->sanitizeOutput($defaultName) . ']';
@@ -520,7 +686,7 @@ HELP;
         }
         
         $cmdline = $this->sanitizeOutput($cmdline);
-        return $this->truncateString($cmdline, self::MAX_CMD_LENGTH);
+        return $this->truncateString($cmdline, self::DEFAULT_CMD_LENGTH);
     }
 
     private function sanitizeOutput(string $text): string {
@@ -533,12 +699,58 @@ HELP;
             return $text;
         }
         
-        return mb_substr($text, 0, $maxLength - 3, 'UTF-8') . '...';
+        $truncated = mb_substr($text, 0, $maxLength - 3, 'UTF-8');
+        return $truncated . '...';
+    }
+
+    private function partialSort(array &$array, string $field, int $limit): void {
+        if ($limit >= count($array)) {
+            usort($array, function($a, $b) use ($field) {
+                $result = $b[$field] <=> $a[$field];
+                return $result !== 0 ? $result : $a['pid'] <=> $b['pid'];
+            });
+            return;
+        }
+        
+        $heap = new SplMaxHeap();
+        $heapCount = 0;
+        
+        foreach ($array as $index => $item) {
+            $value = $item[$field];
+            $heap->insert([$value, $index]);
+            $heapCount++;
+            
+            if ($heapCount > $limit) {
+                $heap->extract();
+                $heapCount--;
+            }
+        }
+        
+        $topIndices = [];
+        while (!$heap->isEmpty()) {
+            $top = $heap->extract();
+            $topIndices[] = $top[1];
+        }
+        
+        $topItems = [];
+        foreach ($topIndices as $index) {
+            $topItems[] = $array[$index];
+        }
+        
+        usort($topItems, function($a, $b) use ($field) {
+            $result = $b[$field] <=> $a[$field];
+            return $result !== 0 ? $result : $a['pid'] <=> $b['pid'];
+        });
+        
+        $array = $topItems;
     }
 
     private function render(array $processes): void {
         if (empty($processes)) {
             echo "No processes found or insufficient permissions.\n";
+            if (!posix_geteuid() == 0) {
+                echo "Try running with sudo for more complete results.\n";
+            }
             return;
         }
         
@@ -550,24 +762,32 @@ HELP;
             default => 'cpu',
         };
         
-        usort($processes, function($a, $b) use ($sortField) {
-            $result = $b[$sortField] <=> $a[$sortField];
-            return $result !== 0 ? $result : $a['pid'] <=> $b['pid'];
-        });
-        
         $displayCount = min($this->limit, count($processes));
-        $displayProcesses = array_slice($processes, 0, $displayCount);
         
-        printf("%-6s %-6s %-10s %-6s %s\n", 'PID', 'CPU%', 'MEM(MB)', 'STATE', 'COMMAND');
+        if ($displayCount < count($processes)) {
+            $this->partialSort($processes, $sortField, $displayCount);
+            $displayProcesses = array_slice($processes, 0, $displayCount);
+        } else {
+            usort($processes, function($a, $b) use ($sortField) {
+                $result = $b[$sortField] <=> $a[$sortField];
+                return $result !== 0 ? $result : $a['pid'] <=> $b['pid'];
+            });
+            $displayProcesses = $processes;
+        }
+        
+        $memoryUnit = $this->useMb ? 'MB' : 'KB';
+        $memoryLabel = "MEM({$memoryUnit})";
+        
+        printf("%-6s %-6s %-12s %-6s %s\n", 'PID', 'CPU%', $memoryLabel, 'STATE', 'COMMAND');
         echo str_repeat('-', 80) . "\n";
         
-        $totalCpu = 0;
-        $totalMem = 0;
+        $totalCpu = 0.0;
+        $totalMem = 0.0;
         
         foreach ($displayProcesses as $proc) {
             $pidDisplay = $proc['type'] === 'thread' ? "  {$proc['pid']}" : (string)$proc['pid'];
             
-            printf("%-6s %-6.1f %-10.1f %-6s %s\n",
+            printf("%-6s %-6.1f %-12.1f %-6s %s\n",
                 $pidDisplay,
                 $proc['cpu'],
                 $proc['memory'],
@@ -581,8 +801,8 @@ HELP;
         
         if (!$this->watch) {
             echo str_repeat('-', 80) . "\n";
-            printf("Top %d processes: %.1f%% CPU, %.1f MB MEM\n",
-                $displayCount, $totalCpu, $totalMem);
+            printf("Top %d processes: %.1f%% CPU, %.1f %s\n",
+                $displayCount, $totalCpu, $totalMem, $memoryUnit);
         }
     }
 }
@@ -592,6 +812,10 @@ try {
     $procStat->run();
 } catch (Throwable $e) {
     fwrite(STDERR, "Error: " . $e->getMessage() . "\n");
+    if ($e->getCode() !== 0) {
+        fwrite(STDERR, "Error code: " . $e->getCode() . "\n");
+    }
     fwrite(STDERR, "Use --help for usage information.\n");
+    fwrite(STDERR, "Note: Some systems may require sudo/root privileges.\n");
     exit(1);
 }
