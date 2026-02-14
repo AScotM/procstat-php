@@ -26,6 +26,7 @@ class ProcStat {
     private const DEFAULT_CMD_LENGTH = 80;
     private const VALID_SORTS = ['cpu', 'mem', 'pid', 'command', 'time'];
     private const FLOAT_EPSILON = 0.00001;
+    private const MAX_STATS_AGE = 60;
 
     private bool $shutdownRequested = false;
     private array $previousStats = [];
@@ -116,10 +117,14 @@ class ProcStat {
     private function setupResourceLimits(): void {
         if (function_exists('setrlimit')) {
             $maxFiles = min(4096, $this->maxPidScan * 3);
-            @setrlimit(RLIMIT_NOFILE, $maxFiles, $maxFiles);
+            if (defined('RLIMIT_NOFILE')) {
+                @setrlimit(RLIMIT_NOFILE, $maxFiles, $maxFiles);
+            }
             
             $maxTime = 30;
-            @setrlimit(RLIMIT_CPU, $maxTime, $maxTime);
+            if (defined('RLIMIT_CPU')) {
+                @setrlimit(RLIMIT_CPU, $maxTime, $maxTime);
+            }
         }
     }
 
@@ -243,7 +248,7 @@ class ProcStat {
         
         $output = [];
         $result = -1;
-        @exec('getconf CLK_TCK', $output, $result);
+        @exec(escapeshellcmd('getconf CLK_TCK'), $output, $result);
         
         if ($result === 0 && isset($output[0])) {
             $hz = (int)$output[0];
@@ -396,6 +401,15 @@ HELP;
         }
     }
 
+    private function cleanupOldStats(): void {
+        $now = microtime(true);
+        foreach ($this->previousStats as $key => $stat) {
+            if ($now - $stat['timestamp'] > self::MAX_STATS_AGE) {
+                unset($this->previousStats[$key]);
+            }
+        }
+    }
+
     private function runOnceWithUptime(float $uptime): void {
         $startTime = microtime(true);
         $processes = [];
@@ -411,6 +425,8 @@ HELP;
         $currentScanTime = microtime(true);
         $interval = $this->previousUptime !== null ? $currentScanTime - $this->lastScanTime : 1.0;
         $this->lastScanTime = $currentScanTime;
+        
+        $this->cleanupOldStats();
         
         foreach ($pids as $pid) {
             $procCount++;
@@ -606,14 +622,14 @@ HELP;
             'timestamp' => microtime(true)
         ];
         
-        $memory = $this->getMemoryUsage($tid);
+        $memory = $this->getMemoryUsage($pid);
         
         return [
             'pid' => $tid,
             'ppid' => $pid,
             'cpu' => round($cpuUsage, 1),
             'memory' => round($memory, 1),
-            'command' => '└─ ' . $this->sanitizeOutput($name),
+            'command' => '  └─ ' . $this->sanitizeOutput($name),
             'state' => $state,
             'time' => round($totalTime / $this->hertz, 1),
             'type' => 'thread'
@@ -748,7 +764,7 @@ HELP;
     private function render(array $processes): void {
         if (empty($processes)) {
             echo "No processes found or insufficient permissions.\n";
-            if (!posix_geteuid() == 0) {
+            if (function_exists('posix_geteuid') && posix_geteuid() != 0) {
                 echo "Try running with sudo for more complete results.\n";
             }
             return;
