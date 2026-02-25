@@ -16,6 +16,7 @@ class ProcStat {
     private int $maxPidScan;
     private bool $useMb;
     private float $lastScanTime;
+    private bool $json;
 
     private const DEFAULT_HERTZ = 100.0;
     private const MIN_UPTIME = 0.1;
@@ -26,11 +27,19 @@ class ProcStat {
     private const DEFAULT_CMD_LENGTH = 80;
     private const VALID_SORTS = ['cpu', 'mem', 'pid', 'command', 'time'];
     private const FLOAT_EPSILON = 0.00001;
-    private const MAX_STATS_AGE = 60;
+    private const MAX_STATS_AGE = 5;
+    private const MAX_THREADS_PER_PROCESS = 100;
+    private const CACHE_TTL = 1;
+    private const BATCH_SIZE = 100;
+    private const BATCH_DELAY_US = 1000;
+    private const MAX_STATS_SIZE = 1000000;
 
     private bool $shutdownRequested = false;
     private array $previousStats = [];
     private ?float $previousUptime = null;
+    private array $statCache = [];
+    private array $lastCacheTime = [];
+    private array $lastReadTime = [];
 
     public function __construct() {
         if (PHP_OS_FAMILY !== 'Linux') {
@@ -59,6 +68,7 @@ class ProcStat {
             "max-scan:",
             "kb",
             "mb",
+            "json",
         ];
 
         $options = getopt($shortOpts, $longOpts);
@@ -76,6 +86,7 @@ class ProcStat {
         $this->threadLimit = (int)($options['thread-limit'] ?? self::DEFAULT_THREAD_LIMIT);
         $this->maxPidScan = (int)($options['max-scan'] ?? self::DEFAULT_MAX_PID_SCAN);
         $this->useMb = !isset($options['kb']);
+        $this->json = isset($options['json']);
         
         if (isset($options['watch'])) {
             $this->watch = true;
@@ -267,7 +278,9 @@ class ProcStat {
     }
 
     public function run(): void {
-        if ($this->watch) {
+        if ($this->json) {
+            $this->runOnce();
+        } elseif ($this->watch) {
             $this->runWatchMode();
         } else {
             $this->runOnce();
@@ -292,11 +305,13 @@ Options:
       --max-scan=N      Maximum PIDs to scan (default: 131072)
       --kb              Show memory in kilobytes
       --mb              Show memory in megabytes (default)
+      --json            Output in JSON format
 
 Examples:
   {$scriptName} --limit=10 --sort=mem
   {$scriptName} --watch=5 --threads
   {$scriptName} --verbose --zombie --kb
+  {$scriptName} --limit=20 --sort=cpu --json
   sudo {$scriptName} --limit=20 --sort=cpu
 
 Note: Some systems may require sudo/root privileges to read all process information.
@@ -401,8 +416,39 @@ HELP;
         }
     }
 
+    private function shouldCache(string $key): bool {
+        $now = microtime(true);
+        if (isset($this->lastCacheTime[$key])) {
+            if ($now - $this->lastCacheTime[$key] < self::CACHE_TTL) {
+                return false;
+            }
+        }
+        $this->lastCacheTime[$key] = $now;
+        return true;
+    }
+
+    private function rateLimitRead(string $path, int $minInterval = 100000): bool {
+        $now = microtime(true);
+        if (isset($this->lastReadTime[$path])) {
+            if ($now - $this->lastReadTime[$path] < $minInterval) {
+                return false;
+            }
+        }
+        $this->lastReadTime[$path] = $now;
+        return true;
+    }
+
     private function cleanupOldStats(): void {
         $now = microtime(true);
+        $maxStats = min($this->maxPidScan * 2, self::MAX_STATS_SIZE);
+        
+        if (count($this->previousStats) > $maxStats) {
+            uasort($this->previousStats, function($a, $b) {
+                return $b['timestamp'] <=> $a['timestamp'];
+            });
+            $this->previousStats = array_slice($this->previousStats, 0, $maxStats, true);
+        }
+        
         foreach ($this->previousStats as $key => $stat) {
             if ($now - $stat['timestamp'] > self::MAX_STATS_AGE) {
                 unset($this->previousStats[$key]);
@@ -410,82 +456,49 @@ HELP;
         }
     }
 
-    private function runOnceWithUptime(float $uptime): void {
-        $startTime = microtime(true);
+    private function readProcessesBatch(array $pids, float $interval): array {
         $processes = [];
-        $procCount = 0;
-        $errorCount = 0;
+        $batches = array_chunk($pids, self::BATCH_SIZE);
+        $batchCount = count($batches);
         
-        $pids = $this->scanProcDirectory();
-        if ($pids === null) {
-            echo "Error: Cannot access /proc directory. Check permissions.\n";
-            return;
-        }
-        
-        $currentScanTime = microtime(true);
-        $interval = $this->previousUptime !== null ? $currentScanTime - $this->lastScanTime : 1.0;
-        $this->lastScanTime = $currentScanTime;
-        
-        $this->cleanupOldStats();
-        
-        foreach ($pids as $pid) {
-            $procCount++;
-            
-            if ($procCount > $this->maxPidScan) {
-                if ($this->verbose) {
-                    fwrite(STDERR, "Warning: Too many processes, stopping scan at {$procCount}\n");
+        foreach ($batches as $batchIndex => $batch) {
+            foreach ($batch as $pid) {
+                $process = $this->readProcess($pid, $interval);
+                if ($process !== null) {
+                    $processes[] = $process;
                 }
-                break;
             }
             
-            $process = $this->readProcess($pid, $uptime, $interval);
-            if ($process !== null) {
-                $processes[] = $process;
-                
-                if ($this->threads) {
-                    $threads = $this->readThreads($pid, $uptime, $interval);
-                    $processes = array_merge($processes, $threads);
-                }
-            } else {
-                $errorCount++;
+            if ($batchCount > 1 && $batchIndex < $batchCount - 1) {
+                usleep(self::BATCH_DELAY_US);
             }
         }
         
-        $executionTime = round((microtime(true) - $startTime) * 1000, 2);
-        
-        if ($this->verbose && !$this->watch) {
-            fwrite(STDERR, "Debug: Scanned {$procCount} processes, {$errorCount} errors, took {$executionTime}ms\n");
-        }
-        
-        $this->render($processes);
-        
-        if (!$this->watch) {
-            echo "\nTotal processes displayed: " . count($processes) . "\n";
-            if ($errorCount > 0) {
-                echo "Note: {$errorCount} processes could not be read (permissions or terminated)\n";
-            }
-        }
-        
-        $this->previousUptime = $uptime;
+        return $processes;
     }
 
-    private function scanProcDirectory(): ?array {
-        $entries = @scandir('/proc', SCANDIR_SORT_NONE);
-        if ($entries === false) {
-            return null;
+    private function calculateCpuUsage(float $totalTime, float $previousTotalTime, float $interval): float {
+        if ($interval <= self::FLOAT_EPSILON) {
+            return 0.0;
         }
         
-        $pids = [];
-        foreach ($entries as $entry) {
-            if ($entry !== '.' && $entry !== '..' && ctype_digit($entry)) {
-                $pids[] = (int)$entry;
-            }
+        $timeDiff = $totalTime - $previousTotalTime;
+        if ($timeDiff < 0) {
+            $timeDiff = 0.0;
         }
         
-        return $pids;
+        $cpuUsage = 100.0 * ($timeDiff / $this->hertz) / max($interval, self::FLOAT_EPSILON);
+        
+        return min(max($cpuUsage, 0.0), 100.0);
     }
 
-    private function readProcess(int $pid, float $uptime, float $interval): ?array {
+    private function readProcess(int $pid, float $interval): ?array {
+        $cacheKey = "proc_{$pid}";
+        if (isset($this->statCache[$cacheKey]) && 
+            microtime(true) - $this->statCache[$cacheKey]['time'] < self::CACHE_TTL) {
+            return $this->statCache[$cacheKey]['data'];
+        }
+        
         $statPath = "/proc/{$pid}/stat";
         $content = @file_get_contents($statPath);
         if ($content === false) {
@@ -534,7 +547,7 @@ HELP;
         $memory = $this->getMemoryUsage($pid);
         $command = $this->getProcessCommand($pid, $name);
         
-        return [
+        $result = [
             'pid' => $pid,
             'ppid' => $ppid,
             'cpu' => round($cpuUsage, 1),
@@ -544,9 +557,16 @@ HELP;
             'time' => round($totalTime / $this->hertz, 1),
             'type' => 'process'
         ];
+        
+        $this->statCache[$cacheKey] = [
+            'data' => $result,
+            'time' => microtime(true)
+        ];
+        
+        return $result;
     }
 
-    private function readThreads(int $pid, float $uptime, float $interval): array {
+    private function readThreads(int $pid, float $interval): array {
         $threads = [];
         $taskDir = "/proc/{$pid}/task";
         
@@ -560,8 +580,13 @@ HELP;
         }
         
         $count = 0;
+        $threadLimit = min($this->threadLimit, self::MAX_THREADS_PER_PROCESS);
+        
         foreach ($entries as $entry) {
-            if ($count >= $this->threadLimit) {
+            if ($count >= $threadLimit) {
+                if ($this->verbose) {
+                    fwrite(STDERR, "Debug: Reached thread limit {$threadLimit} for PID {$pid}\n");
+                }
                 break;
             }
             
@@ -574,17 +599,20 @@ HELP;
                 continue;
             }
             
-            $thread = $this->readThread($pid, $tid, $uptime, $interval);
-            if ($thread !== null) {
-                $threads[] = $thread;
-                $count++;
+            $cacheKey = "{$pid}_{$tid}_thread";
+            if ($this->shouldCache($cacheKey)) {
+                $thread = $this->readThread($pid, $tid, $interval);
+                if ($thread !== null) {
+                    $threads[] = $thread;
+                    $count++;
+                }
             }
         }
         
         return $threads;
     }
 
-    private function readThread(int $pid, int $tid, float $uptime, float $interval): ?array {
+    private function readThread(int $pid, int $tid, float $interval): ?array {
         $statPath = "/proc/{$pid}/task/{$tid}/stat";
         $content = @file_get_contents($statPath);
         if ($content === false) {
@@ -636,29 +664,6 @@ HELP;
         ];
     }
 
-    private function calculateCpuUsage(float $totalTime, float $previousTotalTime, float $interval): float {
-        if ($interval <= self::FLOAT_EPSILON) {
-            return 0.0;
-        }
-        
-        $timeDiff = $totalTime - $previousTotalTime;
-        if ($timeDiff < 0) {
-            $timeDiff = 0.0;
-        }
-        
-        $cpuUsage = 100.0 * ($timeDiff / $this->hertz) / $interval;
-        
-        if ($cpuUsage < 0.0) {
-            return 0.0;
-        }
-        
-        if ($cpuUsage > 100.0) {
-            return 100.0;
-        }
-        
-        return $cpuUsage;
-    }
-
     private function getMemoryUsage(int $pid): float {
         $statusPath = "/proc/{$pid}/status";
         $content = @file_get_contents($statusPath);
@@ -668,12 +673,21 @@ HELP;
         
         $lines = explode("\n", $content);
         $rss = 0;
+        $vms = 0;
+        $shared = 0;
         
         foreach ($lines as $line) {
             if (str_starts_with($line, 'VmRSS:')) {
                 if (preg_match('/VmRSS:\s+(\d+)\s*kB/', $line, $matches)) {
                     $rss = (int)$matches[1];
-                    break;
+                }
+            } elseif (str_starts_with($line, 'VmSize:')) {
+                if (preg_match('/VmSize:\s+(\d+)\s*kB/', $line, $matches)) {
+                    $vms = (int)$matches[1];
+                }
+            } elseif (str_starts_with($line, 'RssFile:') || str_starts_with($line, 'RssShmem:')) {
+                if (preg_match('/Rss\w+:\s+(\d+)\s*kB/', $line, $matches)) {
+                    $shared += (int)$matches[1];
                 }
             }
         }
@@ -761,7 +775,37 @@ HELP;
         $array = $topItems;
     }
 
-    private function render(array $processes): void {
+    private function buildProcessTree(array $processes): array {
+        $tree = [];
+        $byPid = [];
+        
+        foreach ($processes as $proc) {
+            $byPid[$proc['pid']] = $proc;
+        }
+        
+        foreach ($processes as $proc) {
+            if (isset($byPid[$proc['ppid']])) {
+                $tree[$proc['ppid']]['children'][] = $proc;
+            } else {
+                $tree[0]['children'][] = $proc;
+            }
+        }
+        
+        return $tree;
+    }
+
+    private function renderJson(array $processes): void {
+        $output = [
+            'timestamp' => time(),
+            'uptime' => $this->previousUptime,
+            'total_processes' => count($processes),
+            'processes' => $processes
+        ];
+        
+        echo json_encode($output, JSON_PRETTY_PRINT) . "\n";
+    }
+
+    private function renderTable(array $processes): void {
         if (empty($processes)) {
             echo "No processes found or insufficient permissions.\n";
             if (function_exists('posix_geteuid') && posix_geteuid() != 0) {
@@ -820,6 +864,79 @@ HELP;
             printf("Top %d processes: %.1f%% CPU, %.1f %s\n",
                 $displayCount, $totalCpu, $totalMem, $memoryUnit);
         }
+    }
+
+    private function render(array $processes): void {
+        if ($this->json) {
+            $this->renderJson($processes);
+        } else {
+            $this->renderTable($processes);
+        }
+    }
+
+    private function runOnceWithUptime(float $uptime): void {
+        $startTime = microtime(true);
+        $errorCount = 0;
+        
+        $pids = $this->scanProcDirectory();
+        if ($pids === null) {
+            echo "Error: Cannot access /proc directory. Check permissions.\n";
+            return;
+        }
+        
+        $currentScanTime = microtime(true);
+        $interval = $this->previousUptime !== null ? $currentScanTime - $this->lastScanTime : 1.0;
+        $this->lastScanTime = $currentScanTime;
+        
+        $this->cleanupOldStats();
+        
+        $processes = $this->readProcessesBatch($pids, $interval);
+        
+        if ($this->threads) {
+            $threadStartTime = microtime(true);
+            $threadCount = 0;
+            
+            foreach ($processes as $proc) {
+                $threads = $this->readThreads($proc['pid'], $interval);
+                $processes = array_merge($processes, $threads);
+                $threadCount += count($threads);
+            }
+            
+            if ($this->verbose) {
+                fwrite(STDERR, "Debug: Read {$threadCount} threads in " . 
+                    round((microtime(true) - $threadStartTime) * 1000, 2) . "ms\n");
+            }
+        }
+        
+        $executionTime = round((microtime(true) - $startTime) * 1000, 2);
+        
+        if ($this->verbose && !$this->watch) {
+            fwrite(STDERR, "Debug: Read " . count($processes) . " entries, took {$executionTime}ms\n");
+        }
+        
+        $this->render($processes);
+        
+        if (!$this->watch && !$this->json) {
+            echo "\nTotal entries displayed: " . count($processes) . "\n";
+        }
+        
+        $this->previousUptime = $uptime;
+    }
+
+    private function scanProcDirectory(): ?array {
+        $entries = @scandir('/proc', SCANDIR_SORT_NONE);
+        if ($entries === false) {
+            return null;
+        }
+        
+        $pids = [];
+        foreach ($entries as $entry) {
+            if ($entry !== '.' && $entry !== '..' && ctype_digit($entry)) {
+                $pids[] = (int)$entry;
+            }
+        }
+        
+        return $pids;
     }
 }
 
