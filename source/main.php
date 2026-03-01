@@ -581,6 +581,7 @@ HELP;
         
         $count = 0;
         $threadLimit = min($this->threadLimit, self::MAX_THREADS_PER_PROCESS);
+        $processMemory = $this->getMemoryUsage($pid);
         
         foreach ($entries as $entry) {
             if ($count >= $threadLimit) {
@@ -600,19 +601,29 @@ HELP;
             }
             
             $cacheKey = "{$pid}_{$tid}_thread";
-            if ($this->shouldCache($cacheKey)) {
-                $thread = $this->readThread($pid, $tid, $interval);
-                if ($thread !== null) {
-                    $threads[] = $thread;
-                    $count++;
-                }
+            
+            if (isset($this->statCache[$cacheKey]) && 
+                microtime(true) - $this->statCache[$cacheKey]['time'] < self::CACHE_TTL) {
+                $threads[] = $this->statCache[$cacheKey]['data'];
+                $count++;
+                continue;
+            }
+            
+            $thread = $this->readThread($pid, $tid, $interval, $processMemory);
+            if ($thread !== null) {
+                $this->statCache[$cacheKey] = [
+                    'data' => $thread,
+                    'time' => microtime(true)
+                ];
+                $threads[] = $thread;
+                $count++;
             }
         }
         
         return $threads;
     }
 
-    private function readThread(int $pid, int $tid, float $interval): ?array {
+    private function readThread(int $pid, int $tid, float $interval, float $processMemory): ?array {
         $statPath = "/proc/{$pid}/task/{$tid}/stat";
         $content = @file_get_contents($statPath);
         if ($content === false) {
@@ -650,13 +661,11 @@ HELP;
             'timestamp' => microtime(true)
         ];
         
-        $memory = $this->getMemoryUsage($pid);
-        
         return [
             'pid' => $tid,
             'ppid' => $pid,
             'cpu' => round($cpuUsage, 1),
-            'memory' => round($memory, 1),
+            'memory' => round($processMemory, 1),
             'command' => '  └─ ' . $this->sanitizeOutput($name),
             'state' => $state,
             'time' => round($totalTime / $this->hertz, 1),
@@ -665,6 +674,12 @@ HELP;
     }
 
     private function getMemoryUsage(int $pid): float {
+        $cacheKey = "mem_{$pid}";
+        if (isset($this->statCache[$cacheKey]) && 
+            microtime(true) - $this->statCache[$cacheKey]['time'] < self::CACHE_TTL) {
+            return $this->statCache[$cacheKey]['data'];
+        }
+        
         $statusPath = "/proc/{$pid}/status";
         $content = @file_get_contents($statusPath);
         if ($content === false) {
@@ -673,22 +688,13 @@ HELP;
         
         $lines = explode("\n", $content);
         $rss = 0;
-        $vms = 0;
-        $shared = 0;
         
         foreach ($lines as $line) {
             if (str_starts_with($line, 'VmRSS:')) {
                 if (preg_match('/VmRSS:\s+(\d+)\s*kB/', $line, $matches)) {
                     $rss = (int)$matches[1];
                 }
-            } elseif (str_starts_with($line, 'VmSize:')) {
-                if (preg_match('/VmSize:\s+(\d+)\s*kB/', $line, $matches)) {
-                    $vms = (int)$matches[1];
-                }
-            } elseif (str_starts_with($line, 'RssFile:') || str_starts_with($line, 'RssShmem:')) {
-                if (preg_match('/Rss\w+:\s+(\d+)\s*kB/', $line, $matches)) {
-                    $shared += (int)$matches[1];
-                }
+                break;
             }
         }
         
@@ -696,11 +702,14 @@ HELP;
             return 0.0;
         }
         
-        if ($this->useMb) {
-            return $rss / 1024.0;
-        }
+        $memory = $this->useMb ? $rss / 1024.0 : (float)$rss;
         
-        return (float)$rss;
+        $this->statCache[$cacheKey] = [
+            'data' => $memory,
+            'time' => microtime(true)
+        ];
+        
+        return $memory;
     }
 
     private function getProcessCommand(int $pid, string $defaultName): string {
@@ -876,7 +885,6 @@ HELP;
 
     private function runOnceWithUptime(float $uptime): void {
         $startTime = microtime(true);
-        $errorCount = 0;
         
         $pids = $this->scanProcDirectory();
         if ($pids === null) {
@@ -894,16 +902,19 @@ HELP;
         
         if ($this->threads) {
             $threadStartTime = microtime(true);
-            $threadCount = 0;
+            $allThreads = [];
             
             foreach ($processes as $proc) {
                 $threads = $this->readThreads($proc['pid'], $interval);
-                $processes = array_merge($processes, $threads);
-                $threadCount += count($threads);
+                if (!empty($threads)) {
+                    array_push($allThreads, ...$threads);
+                }
             }
             
+            $processes = array_merge($processes, $allThreads);
+            
             if ($this->verbose) {
-                fwrite(STDERR, "Debug: Read {$threadCount} threads in " . 
+                fwrite(STDERR, "Debug: Read " . count($allThreads) . " threads in " . 
                     round((microtime(true) - $threadStartTime) * 1000, 2) . "ms\n");
             }
         }
