@@ -510,13 +510,14 @@ HELP;
     {
         $cacheKey = "proc_{$pid}";
         if (isset($this->statCache[$cacheKey]) && 
+            isset($this->statCache[$cacheKey]['time']) &&
             microtime(true) - $this->statCache[$cacheKey]['time'] < self::CACHE_TTL) {
             return $this->statCache[$cacheKey]['data'];
         }
         
         try {
             $statPath = "/proc/{$pid}/stat";
-            $content = file_get_contents($statPath);
+            $content = @file_get_contents($statPath);
             if ($content === false) {
                 return null;
             }
@@ -554,7 +555,8 @@ HELP;
         $totalTime = $utime + $stime + $cutime + $cstime;
         
         $previousKey = "{$pid}_process";
-        $previousTotalTime = $this->previousStats[$previousKey]['total_time'] ?? 0.0;
+        $previousTotalTime = isset($this->previousStats[$previousKey]) ? 
+            (float)($this->previousStats[$previousKey]['total_time'] ?? 0.0) : 0.0;
         
         $cpuUsage = $this->calculateCpuUsage($totalTime, $previousTotalTime, $interval);
         
@@ -595,7 +597,7 @@ HELP;
         }
         
         try {
-            $entries = scandir($taskDir, SCANDIR_SORT_NONE);
+            $entries = @scandir($taskDir, SCANDIR_SORT_NONE);
             if ($entries === false) {
                 return $threads;
             }
@@ -627,6 +629,7 @@ HELP;
             $cacheKey = "{$pid}_{$tid}_thread";
             
             if (isset($this->statCache[$cacheKey]) && 
+                isset($this->statCache[$cacheKey]['time']) &&
                 microtime(true) - $this->statCache[$cacheKey]['time'] < self::CACHE_TTL) {
                 $threads[] = $this->statCache[$cacheKey]['data'];
                 $count++;
@@ -657,7 +660,7 @@ HELP;
     {
         try {
             $statPath = "/proc/{$pid}/task/{$tid}/stat";
-            $content = file_get_contents($statPath);
+            $content = @file_get_contents($statPath);
             if ($content === false) {
                 return null;
             }
@@ -687,7 +690,8 @@ HELP;
         $totalTime = $utime + $stime;
         
         $previousKey = "{$pid}_{$tid}_thread";
-        $previousTotalTime = $this->previousStats[$previousKey]['total_time'] ?? 0.0;
+        $previousTotalTime = isset($this->previousStats[$previousKey]) ? 
+            (float)($this->previousStats[$previousKey]['total_time'] ?? 0.0) : 0.0;
         
         $cpuUsage = $this->calculateCpuUsage($totalTime, $previousTotalTime, $interval);
         
@@ -700,8 +704,8 @@ HELP;
             'pid' => $tid,
             'ppid' => $pid,
             'cpu' => round($cpuUsage, 1),
-            'memory' => round($processMemory, 1),
-            'command' => '  └─ ' . $this->sanitizeOutput($name),
+            'memory' => 0.0,
+            'command' => '  |- ' . $this->sanitizeOutput($name),
             'state' => $state,
             'time' => round($totalTime / $this->hertz, 1),
             'type' => 'thread'
@@ -724,7 +728,7 @@ HELP;
         
         try {
             $statusPath = "/proc/{$pid}/status";
-            $content = file_get_contents($statusPath);
+            $content = @file_get_contents($statusPath);
             if ($content === false) {
                 return 0.0;
             }
@@ -764,7 +768,7 @@ HELP;
     {
         try {
             $cmdlinePath = "/proc/{$pid}/cmdline";
-            $content = file_get_contents($cmdlinePath);
+            $content = @file_get_contents($cmdlinePath);
             if ($content === false || strlen($content) === 0) {
                 return '[' . $this->sanitizeOutput($defaultName) . ']';
             }
@@ -807,52 +811,60 @@ HELP;
         if (count($array) <= $limit) {
             usort($array, function($a, $b) use ($field) {
                 $result = $b[$field] <=> $a[$field];
-                return $result !== 0 ? $result : $a['pid'] <=> $b['pid'];
+                return $result !== 0 ? $result : ($a['pid'] <=> $b['pid']);
             });
             return;
         }
         
-        $heap = new SplMinHeap();
+        $topItems = [];
         
         foreach ($array as $item) {
             $value = $item[$field];
             
-            if ($heap->count() < $limit) {
-                $heap->insert([$value, $item]);
-                continue;
-            }
-            
-            $smallest = $heap->top();
-            if ($value > $smallest[0]) {
-                $heap->extract();
-                $heap->insert([$value, $item]);
+            if (count($topItems) < $limit) {
+                $topItems[] = $item;
+                usort($topItems, function($x, $y) use ($field) {
+                    return $y[$field] <=> $x[$field];
+                });
+            } else {
+                $smallest = $topItems[$limit - 1];
+                if ($value > $smallest[$field]) {
+                    $topItems[$limit - 1] = $item;
+                    usort($topItems, function($x, $y) use ($field) {
+                        return $y[$field] <=> $x[$field];
+                    });
+                }
             }
         }
         
-        $result = [];
-        while (!$heap->isEmpty()) {
-            $result[] = $heap->extract()[1];
-        }
-        
-        usort($result, function($a, $b) use ($field) {
-            $result = $b[$field] <=> $a[$field];
-            return $result !== 0 ? $result : $a['pid'] <=> $b['pid'];
-        });
-        
-        $array = $result;
+        $array = $topItems;
     }
 
     private function renderJson(array $processes): void
     {
+        $displayCount = min($this->limit, count($processes));
+        $processes = array_slice($processes, 0, $displayCount);
+        
         $output = [
             'timestamp' => time(),
             'uptime' => $this->previousUptime,
             'cpu_cores' => $this->cpuCores,
             'total_processes' => count($processes),
-            'processes' => $processes
+            'processes' => array_map(function($proc) {
+                return [
+                    'pid' => $proc['pid'],
+                    'ppid' => $proc['ppid'] ?? 0,
+                    'cpu' => $proc['cpu'],
+                    'memory' => $proc['memory'],
+                    'command' => $proc['command'],
+                    'state' => $proc['state'],
+                    'time' => $proc['time'],
+                    'type' => $proc['type'] ?? 'process'
+                ];
+            }, $processes)
         ];
         
-        echo json_encode($output, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR) . "\n";
+        echo json_encode($output, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES) . "\n";
     }
 
     private function renderTable(array $processes): void
@@ -876,14 +888,14 @@ HELP;
         $displayCount = min($this->limit, count($processes));
         
         if ($displayCount < count($processes)) {
-            $this->partialSort($processes, $sortField, $displayCount);
-            $displayProcesses = array_slice($processes, 0, $displayCount);
-        } else {
-            usort($processes, function($a, $b) use ($sortField) {
-                $result = $b[$sortField] <=> $a[$sortField];
-                return $result !== 0 ? $result : $a['pid'] <=> $b['pid'];
-            });
             $displayProcesses = $processes;
+            $this->partialSort($displayProcesses, $sortField, $displayCount);
+        } else {
+            $displayProcesses = $processes;
+            usort($displayProcesses, function($a, $b) use ($sortField) {
+                $result = $b[$sortField] <=> $a[$sortField];
+                return $result !== 0 ? $result : ($a['pid'] <=> $b['pid']);
+            });
         }
         
         $memoryUnit = $this->useMb ? 'MB' : 'KB';
@@ -898,16 +910,18 @@ HELP;
         foreach ($displayProcesses as $proc) {
             $pidDisplay = $proc['type'] === 'thread' ? "  {$proc['pid']}" : (string)$proc['pid'];
             
+            if ($proc['type'] !== 'thread') {
+                $totalCpu += $proc['cpu'];
+                $totalMem += $proc['memory'];
+            }
+            
             printf("%-6s %-8.1f %-12.1f %-6s %s\n",
                 $pidDisplay,
                 $proc['cpu'],
-                $proc['memory'],
+                $proc['type'] === 'thread' ? 0.0 : $proc['memory'],
                 $proc['state'],
                 $proc['command']
             );
-            
-            $totalCpu += $proc['cpu'];
-            $totalMem += $proc['memory'];
         }
         
         if (!$this->watch) {
@@ -940,6 +954,8 @@ HELP;
         
         $currentScanTime = microtime(true);
         $interval = $this->previousUptime !== null ? $currentScanTime - $this->lastScanTime : 1.0;
+        $interval = max(0.1, min(10.0, $interval));
+        
         $this->lastScanTime = $currentScanTime;
         
         $this->cleanupOldStats();
